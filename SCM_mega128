@@ -1,0 +1,969 @@
+//Woring for the Mega128 chip
+#include "avr/io.h"
+#include "avr/interrupt.h"
+#define  F_CPU  8000000UL
+#include "util/delay.h"
+
+#define uchar unsigned char
+#define uint  unsigned int
+#define PERIOD 0
+#define CLOCKWISE 1
+#define ANTICLOCKWISE -1
+#define STOP 0
+#define SLOW 0
+#define QUICK 1
+#define BLACK 0
+#define WHITE 1
+#define IS ==
+#define NOT !=
+#define F 1
+#define B -1
+#define L -1
+#define R 1
+#define U 1
+#define D -1
+#define CONTINUE -1
+#define DONE_CAN 0
+#define DONE_BLOCK 1
+#define ERROR -1
+#define BAUD 9600UL
+#define MAX_OPEN 140
+#define OPEN_FOR_BLOCK 52
+#define OPEN_FOR_POP_CAN 70
+#define OPEN_FOR_SUPPLY 90
+
+uchar list[] = {'0', '0', '0', '0'};//A  B  C  D
+uint position[] = {3, 3, 3, 3};//A  B  C  D
+uint FOR[] = {0X01, 0x03, 0X02, 0x06, 0X04, 0x0c, 0X08, 0x09};
+uint REV[] = {0x09, 0X08, 0x0c, 0X04, 0x06, 0X02, 0x03, 0X01};
+uint Line_Sensor[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+uint Line_GPS;
+uint flag, flag2, flag3;
+uint count = 0;
+uint count2 = 0;
+uint temp_time = 6000, temp_time2 = 6000;
+uint nowaposition;
+uint rightsensor;
+uchar nowasuparea;
+uint supplynum = 0;
+int tag = 'D';
+int counter = 0;
+int supplyresult;
+
+void Mov_Big_Step_Motor(int direction, double rounds)//控制丝杆步进电机 U上D下 PE4控制上下 PE3控制CLK
+{
+    int i;
+
+    DDRE |= 0X18;
+	PORTE |= 0X08;
+	if(direction IS U)
+	    PORTE |= (1 << PE4);
+    else
+	    PORTE &= ~(1 << PE4);
+
+    for(i = 0; i < (int)(rounds * 400); i ++)
+	{
+		_delay_ms(1.5);
+		PORTE ^= 0x08;
+	}
+}
+
+void Mov_Medium_Step_Motor(int direction, double rounds)//控制齿条步进电机 F前B后 PE6控制前后 PE5控制CLK
+{
+    int i;
+
+    DDRE |= 0X60;
+	PORTE |= 0X20;
+	if(direction IS B)
+	    PORTE |= (1 << PE6);
+    else
+	    PORTE &= ~(1 << PE6);
+
+    for(i = 0; i < (int)(rounds * 400); i ++)
+	{
+		_delay_ms(4);
+		PORTE ^= 0x20;
+	}
+}
+
+void Uart0_Init(void)//串口通信  PE0  PE1不能用
+{
+    UCSR0B = 0x00; //关闭UART00
+    UCSR0A = 0x00; //不使用倍速发送（异步）
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00); //数据位为8位
+    UBRR0L = (F_CPU / 16 / BAUD - 1) % 256; //异步正常情况下的计算公式
+    UBRR0H = (F_CPU / 16 / BAUD - 1) / 256;
+    UCSR0B = (1 << RXEN0) | (1 << TXEN0); //接收使能和发送使能
+}
+
+void Send_Char_Message(uchar c)
+{ 
+    while(! (UCSR0A & (1 << UDRE0)));//表明发送器已经准备就绪
+    UDR0 = c; //将要发送的数据装入UDR0寄存器
+} 
+
+uchar Receive_Char_Message(void)
+{
+    while(! (UCSR0A & (1 << RXC0)));//表明已经接收完毕
+    return UDR0;
+}
+
+void Send_Check_Allowable_Message(uchar area)
+{
+
+	Uart0_Init();//UART0初始化
+	_delay_ms(1000);
+	Send_Char_Message((area - 'A') * 2 + ((nowaposition == 4 || nowaposition == 3) ? '1' : '2'));
+}
+
+void Servo_Control(uint PWM, uint MS)//舵机控制程序 
+{
+    while(OCR1A < PWM)
+    {
+        OCR1A ++;
+        _delay_ms(MS);
+    }
+    while(OCR1A > PWM)
+    {
+        OCR1A --;
+        _delay_ms(MS);
+    }
+}
+
+void PWM_Init(void)//舵机PWM波初始化程序   PB5输出PWM波
+{ 
+    TCCR1B |= (1<<WGM13)|(0<<WGM12)|(0<<CS12)|(1<<CS11)|(1<<CS10);      
+	TCCR1A |= (1<<COM1A1)|(0<<COM1A0)|(1<<COM1B1)|(0<<COM1B0)|(0<<WGM11)|(0<<WGM10);
+	ICR1 = 1152;
+	OCR1A = MAX_OPEN;
+}
+
+void PWM_Stop(void)//舵机PWM波停止程序
+{
+	TCCR1A = 0x00;
+	PORTB &= ~(1 << PB5);
+}
+
+void Hand_Open(void)//手爪打开  PB5  140
+{
+	PWM_Init();
+	Servo_Control(MAX_OPEN, 0);
+	_delay_ms(1000);
+}
+
+void Catch_Block(void)//手爪抓木块  PB5  
+{
+	PWM_Init();
+	Servo_Control(OPEN_FOR_BLOCK, 0);
+	_delay_ms(1000);
+}
+
+void Catch_Pop_Can(void)//手爪抓罐子  PB5
+{
+    PWM_Init();
+	Servo_Control(OPEN_FOR_POP_CAN, 0);
+	_delay_ms(1000);
+}
+
+void Get_Position(void)//获取传感器参数
+{
+    if(PINC & (1 << PC0))  Line_Sensor[0] = BLACK;//1号左  PC0
+	else  Line_Sensor[0] = WHITE;
+	if(PINC & (1 << PC1))  Line_Sensor[1] = BLACK;//1号中  PC1
+	else  Line_Sensor[1] = WHITE;
+	if(PINC & (1 << PC2))  Line_Sensor[2] = BLACK;//1号右  PC2
+	else  Line_Sensor[2] = WHITE;
+	if(PINC & (1 << PC3))  Line_Sensor[3] = BLACK;//2号左  PC3
+	else  Line_Sensor[3] = WHITE;
+	if(PINC & (1 << PC4))  Line_Sensor[4] = BLACK;//2号中  PC4
+	else  Line_Sensor[4] = WHITE;
+	if(PINC & (1 << PC5))  Line_Sensor[5] = BLACK;//2号右  PC5
+	else  Line_Sensor[5] = WHITE;
+    if(PINC & (1 << PC6))  Line_Sensor[6] = BLACK;//3号左  PC6
+	else  Line_Sensor[6] = WHITE;
+	if(PINC & (1 << PC7))  Line_Sensor[7] = BLACK;//3号中  PC7
+	else  Line_Sensor[7] = WHITE;
+	if(PIND & (1 << PD4))  Line_Sensor[8] = BLACK;//3号右  PD4
+	else  Line_Sensor[8] = WHITE;
+	if(PIND & (1 << PD5))  Line_Sensor[9] = BLACK;//4号左  PD5
+	else  Line_Sensor[9] = WHITE;
+	if(PIND & (1 << PD6))  Line_Sensor[10] = BLACK;//4号中 PD6
+	else  Line_Sensor[10] = WHITE;
+	if(PIND & (1 << PD7))  Line_Sensor[11] = BLACK;//4号右 PD7
+	else  Line_Sensor[11] = WHITE;
+}
+
+void Motor1(int ctrl)//1号电机  PA0  PA1
+{
+    switch(ctrl)
+	{
+	    case CLOCKWISE:  PORTA &= ~(1 << PA0);  PORTA |= (1 << PA1);  break;
+		case ANTICLOCKWISE:  PORTA |= (1 << PA0);  PORTA &= ~(1 << PA1);  break;
+		case STOP:  PORTA &= ~(1 << PA0);  PORTA &= ~(1 << PA1);  break;
+	}
+}
+
+void Motor2(int ctrl)//2号电机  PA2  PA3
+{
+    switch(ctrl)
+	{
+	    case CLOCKWISE:  PORTA &= ~(1 << PA2);  PORTA |= (1 << PA3);  break;
+		case ANTICLOCKWISE:  PORTA |= (1 << PA2);  PORTA &= ~(1 << PA3);  break;
+		case STOP:  PORTA &= ~(1 << PA2);  PORTA &= ~(1 << PA3);  break;
+	}
+}
+
+void Motor3(int ctrl)//3号电机  PA4  PA5
+{
+    switch(ctrl)
+	{
+	    case CLOCKWISE:  PORTA &= ~(1 << PA4);  PORTA |= (1 << PA5);  break;
+		case ANTICLOCKWISE:  PORTA |= (1 << PA4);  PORTA &= ~(1 << PA5);  break;
+		case STOP:  PORTA &= ~(1 << PA4);  PORTA &= ~(1 << PA5);  break;
+	}
+}
+
+void Motor4(int ctrl)//4号电机  PA6  PA7
+{
+    switch(ctrl)
+	{
+	    case CLOCKWISE:  PORTA &= ~(1 << PA6);  PORTA |= (1 << PA7);  break;
+		case ANTICLOCKWISE:  PORTA |= (1 << PA6);  PORTA &= ~(1 << PA7);  break;
+		case STOP:  PORTA &= ~(1 << PA6);  PORTA &= ~(1 << PA7);  break;
+	}
+}
+
+void Set_Speed(double ratio)//控制占空比  四个电机占空比相同   PB5
+{
+    TCCR0 = 0x00;
+	TCNT0 = 0;
+	OCR0 = (int)(ratio * 256);
+	TCCR0 = 0x62;
+}
+
+void Mov_Forward_Till_White(void)//前行至横向白线  运动函数 
+{
+    EIMSK |= (1 << INT0);
+    Set_Speed(0.95);
+
+	temp_time = 6000;
+	Motor3(CLOCKWISE);
+	Motor4(CLOCKWISE);
+	_delay_ms(300);
+	Get_Position();
+	while(1)
+	{
+        while(Line_Sensor[7] IS BLACK && Line_Sensor[10] IS BLACK)
+	    {
+	        Motor3(CLOCKWISE);
+		    Motor4(CLOCKWISE);
+		    Get_Position();
+		}
+	    Motor3(STOP);
+		Motor4(STOP);
+		_delay_ms(300);
+        Get_Position();
+		if(Line_Sensor[7] IS WHITE || Line_Sensor[10] IS WHITE)
+		    break;
+	}
+	PORTA = 0X00;
+	EIMSK &= ~(1 << INT0);
+}
+
+void Mov_Backward_Till_White(void)//后退至横向白线  运动函数 
+{
+    EIMSK |= (1 << INT0);
+    Set_Speed(0.95);
+	
+	temp_time = 6000;
+	Motor3(ANTICLOCKWISE);
+	Motor4(ANTICLOCKWISE);
+	_delay_ms(300);
+	Get_Position();
+	while(1)
+	{
+        while(Line_Sensor[7] IS BLACK && Line_Sensor[10] IS BLACK)
+	    {
+	        Motor3(ANTICLOCKWISE);
+		    Motor4(ANTICLOCKWISE);
+		    Get_Position();
+		}
+	    Motor3(STOP);
+		Motor4(STOP);
+        _delay_ms(300);
+		Get_Position();
+		if(Line_Sensor[7] IS WHITE || Line_Sensor[10] IS WHITE)
+		    break;
+	}
+	PORTA = 0X00;
+    EIMSK &= ~(1 << INT0);
+}
+
+void Mov_Left_Till_White(void)//左行至纵向白线  运动函数
+{
+    EIMSK |= (1 << INT1);
+	Set_Speed(0.95);
+	
+	temp_time2 = 6000;
+	Motor1(ANTICLOCKWISE);
+	Motor2(ANTICLOCKWISE);
+	_delay_ms(300);
+	Get_Position();
+	while(1)
+	{
+        while(Line_Sensor[1] IS BLACK && Line_Sensor[4] IS BLACK)
+	    {
+	        Motor1(ANTICLOCKWISE);
+		    Motor2(ANTICLOCKWISE);
+		    Get_Position();
+		}
+        Motor1(STOP);
+		Motor2(STOP);
+		_delay_ms(300);
+		Get_Position();
+		if(Line_Sensor[1] IS WHITE || Line_Sensor[4] IS WHITE)
+		    break;
+	}
+	PORTA = 0X00;
+	EIMSK &= ~(1 << INT1);
+}
+
+void Mov_Right_Till_White(void)//右行至纵向白线  运动函数
+{
+    EIMSK |= (1 << INT1);
+	Set_Speed(0.95);
+	
+	temp_time2 = 6000;
+	Motor1(CLOCKWISE);
+	Motor2(CLOCKWISE);
+	_delay_ms(300);
+	Get_Position();
+	while(1)
+	{
+        while(Line_Sensor[1] IS BLACK && Line_Sensor[4] IS BLACK)
+	    {
+	        Motor1(CLOCKWISE);
+		    Motor2(CLOCKWISE);
+		    Get_Position();
+		}
+	    Motor1(STOP);
+		Motor2(STOP);
+		_delay_ms(300);
+        Get_Position();
+		if(Line_Sensor[1] IS WHITE || Line_Sensor[4] IS WHITE)
+            break;
+	}
+	PORTA = 0X00;
+	EIMSK &= ~(1 << INT1);
+}
+
+void Mov_Turn_ninty(void)//十字路口原地转90°  运动函数
+{
+	Set_Speed(0.9);
+	Motor1(CLOCKWISE);
+	Motor2(ANTICLOCKWISE);
+	Motor3(CLOCKWISE);
+	Motor4(ANTICLOCKWISE);
+	_delay_ms(250);
+	
+    Get_Position();
+    while(1)
+	{
+	    while(Line_Sensor[1] IS BLACK && Line_Sensor[4] IS BLACK && Line_Sensor[7] IS BLACK && Line_Sensor[10] IS BLACK)
+	    {
+	        Motor1(CLOCKWISE);
+	        Motor2(ANTICLOCKWISE);
+	        Motor3(CLOCKWISE);
+	        Motor4(ANTICLOCKWISE);
+		    Get_Position();
+		}
+		Motor1(STOP);
+		Motor2(STOP);
+		Motor3(STOP);
+		Motor4(STOP);
+		_delay_ms(300);
+        Get_Position();
+		if(Line_Sensor[1] IS WHITE || Line_Sensor[4] IS WHITE || Line_Sensor[7] IS WHITE || Line_Sensor[10] IS WHITE)
+		    break;
+	}
+	PORTA = 0X00;
+}
+
+void Mov_Turn_Around(void)//十字路口原地打转180° 运动函数 
+{
+    EIMSK &= ~(1 << INT0);
+	EIMSK &= ~(1 << INT1);
+    Mov_Turn_ninty();
+	Mov_Turn_ninty();
+	EIMSK |= (1 << INT0) | (1 << INT1);
+}
+
+int Wait_For_Check_Result(int area)//等待电脑发送识别结果 
+{
+    uchar tmp;
+	int i;
+
+	if(area == 'E')
+	{
+	    while(1)
+        {
+            if(UCSR0A & (1 << RXC0))   //如果接收缓存区有数据
+            {
+                tmp = Receive_Char_Message();  //接收数据
+			    Send_Char_Message(tmp);
+                break;
+            }
+        }
+	    for(i = 0; i < 4; i ++)
+		{
+		    if(list[i] == tmp)
+			    break;
+		}
+		if(i != 4)
+		{
+		    nowasuparea = i + 'A';
+			list[i] = '!';
+		}
+		if(i < 2)
+		    return DONE_BLOCK;
+        if(i < 4)
+		    return DONE_CAN;
+        return CONTINUE;
+	}
+	else
+	{
+	    if(nowaposition == 4)
+	    {
+	        switch(area)
+		    {
+		        case 'D':  
+			    case 'C':  return DONE_CAN;  break;
+			    case 'B':
+		        case 'A':  return DONE_BLOCK;  break;
+	        }
+	    }
+        while(1)
+        {
+            if(UCSR0A & (1 << RXC0))   //如果接收缓存区有数据
+            {
+                tmp = Receive_Char_Message();  //接收数据
+			    Send_Char_Message(tmp);
+                break;
+            }
+        }
+	    if(tmp >= 'a' && tmp <= 'h')  
+	        return DONE_CAN;
+	    else if(tmp >= 'A' && tmp <= 'Z')  
+	        return DONE_BLOCK;
+	    else  
+	        return CONTINUE;
+	} 
+}
+
+void Make_Next_Mov(uchar area)//根据区域决定取货识别流程函数 
+{
+     if(area == 'D')
+	 {
+	     switch(nowaposition)
+		 {
+		     case 1:  Mov_Right_Till_White();  Mov_Right_Till_White();  Mov_Accurate_F_B(F, 13000);  break;
+			 case 2:  Mov_Backward_Till_White();  Mov_Accurate_F_B(B, 12469);  break;
+			 case 3:  Mov_Forward_Till_White();  Mov_Accurate_L_R(L, 8000);  Mov_Big_Step_Motor(U, 22);  Mov_Right_Till_White();  Mov_Accurate_F_B(B, 12469);  break;
+			 case 4:  Mov_Forward_Till_White();  Mov_Accurate_F_B(F, 13000);  break;
+		 }
+	 }
+
+	 if(area == 'C')
+	 {
+	     switch(nowaposition)
+		 {
+		     case 1:  Mov_Left_Till_White();  Mov_Turn_Around();  Mov_Forward_Till_White();  Mov_Right_Till_White();  Mov_Accurate_F_B(F, 13000);  break;
+			 case 2:  Mov_Backward_Till_White();  Mov_Accurate_F_B(B, 13000);  break;
+			 case 3:  Mov_Forward_Till_White();  Mov_Accurate_L_R(L, 8000);  Mov_Big_Step_Motor(U, 22);  Mov_Right_Till_White();  Mov_Accurate_F_B(B, 13000);  break;
+			 case 4:  Mov_Forward_Till_White();  Mov_Accurate_F_B(F, 13000);  break;  
+		 }
+	 }
+
+	 if(area == 'B')
+	 {
+	     switch(nowaposition)
+		 {
+		     case 1:  Mov_Left_Till_White();  Mov_Turn_Around();  Mov_Forward_Till_White();  Mov_Forward_Till_White();  Mov_Right_Till_White();  Mov_Accurate_F_B(B, 13800);  break;
+			 case 2:  Mov_Forward_Till_White();  Mov_Accurate_F_B(F, 13000);  break;
+			 case 3:  Mov_Backward_Till_White();  Mov_Accurate_L_R(L, 8000);  Mov_Big_Step_Motor(U, 22);  Mov_Right_Till_White();  Mov_Accurate_F_B(F, 13000);  break;
+			 case 4:  Mov_Backward_Till_White();  Mov_Accurate_F_B(B, 13000);  break;  
+		 }
+	 }
+
+	 if(area == 'A')
+	 {
+	     switch(nowaposition)
+		 {
+		     case 1:  Mov_Left_Till_White();  Mov_Turn_Around();  Mov_Right_Till_White();  Mov_Accurate_F_B(B, 12469);  break;
+			 case 2:  Mov_Forward_Till_White();  Mov_Accurate_F_B(F, 13000);  break;
+			 case 3:  Mov_Backward_Till_White();  Mov_Accurate_L_R(L, 8000);  Mov_Big_Step_Motor(U, 22);  Mov_Right_Till_White();  Mov_Accurate_F_B(F, 13000);  break;
+			 case 4:  Mov_Backward_Till_White();  Mov_Accurate_F_B(B, 12469);  break;  
+		 }
+	 }
+}
+
+void Catch_Or_Not(int result)//抓取或继续移动函数 
+{
+     if(result == CONTINUE)
+	     nowaposition ++;
+     else
+	 {
+      
+	     if(result == DONE_CAN)
+		 {
+		     Mov_Medium_Step_Motor(F, 1.5);
+		     Catch_Pop_Can();
+		     Mov_Big_Step_Motor(U, 1);
+		     Mov_Medium_Step_Motor(B, 1.5);
+		 }
+		 else
+		 {
+		     Mov_Medium_Step_Motor(F, 1.7);
+		     Catch_Block();
+			 Hand_Open();
+			 _delay_ms(500);
+		     Catch_Block();
+			 Mov_Big_Step_Motor(U, 1);
+			 Mov_Medium_Step_Motor(B, 1.7);
+		 }
+		 position[tag - 'A'] = nowaposition;
+		 tag --;
+		 flag = 1;
+	 }
+}
+
+void Get_List_And_Wait_For_Start(void)//获取识别清单并等待比赛开始准备函数 
+{
+    int i;
+	uchar tmp;
+
+    Uart0_Init();
+	_delay_ms(1000);
+    Send_Char_Message('s');
+
+	for(i = 0; i < 4; i ++)
+	{
+	    while(1)
+        {
+            if(UCSR0A & (1 << RXC0))   //如果接收缓存区有数据
+            {
+                list[i] = Receive_Char_Message();  //接收数据
+			    Send_Char_Message(list[i]);
+                break;
+            }
+        }
+	}
+	while(1)
+	{
+	    if(UCSR0A & (1 << RXC0))   //如果接收缓存区有数据
+        {
+            tmp = Receive_Char_Message();  //接收数据
+		    
+            if(tmp == 'S')
+			{
+			    Send_Char_Message(tmp);
+			    break;
+			}
+        }
+	}
+}
+
+void D_Area_Catch(void)//D区域抓取函数 
+{
+     int result;
+
+     nowaposition = 1;
+	 flag = 0;
+	 while(! flag)
+	 {
+         Make_Next_Mov('D');
+		 if(nowaposition != 4)
+             Send_Check_Allowable_Message('D');
+	     result = Wait_For_Check_Result('D');
+		 Catch_Or_Not(result);
+     }
+	 if(nowaposition == 1 || nowaposition == 4)
+	     Mov_Backward_Till_White();
+     else
+	     Mov_Forward_Till_White();
+}
+
+void D_Area_Send(void)//D区域送货函数 
+{
+	 if(nowaposition > 2)
+	 {
+         Mov_Accurate_L_R(L, 8000);
+		 Mov_Big_Step_Motor(D, 22);
+	 }
+     Mov_Left_Till_White();
+	 Mov_Turn_Around();
+     Mov_Right_Till_White();
+	 Mov_Accurate_F_B(F, 12469);
+	 Mov_Medium_Step_Motor(F, 1.5);
+     Mov_Big_Step_Motor(D, 1);
+	 Hand_Open();
+	 Mov_Medium_Step_Motor(B, 1.5);
+	 Mov_Backward_Till_White();
+}
+
+void C_Area_Catch(void)//C区域抓取函数 
+{
+     int result;
+
+     nowaposition = 1;
+	 flag = 0;
+	 while(! flag)
+	 {
+         Make_Next_Mov('C');
+		 if(nowaposition != 4)
+             Send_Check_Allowable_Message('C');
+         result = Wait_For_Check_Result('C');
+		 Catch_Or_Not(result);
+     }
+	 if(nowaposition == 1 || nowaposition == 4)
+	     Mov_Backward_Till_White();
+     else
+	     Mov_Forward_Till_White();
+}
+
+void C_Area_Send(void)//C区域送货函数 
+{
+     if(nowaposition > 2)
+	 {
+         Mov_Accurate_L_R(L, 8000);
+		 Mov_Big_Step_Motor(D, 22);
+	 }
+     Mov_Left_Till_White();
+	 Mov_Turn_Around();
+     Mov_Forward_Till_White();
+	 Mov_Right_Till_White();
+	 Mov_Accurate_F_B(B, 12500);
+	 Mov_Medium_Step_Motor(F, 1.5);
+     Mov_Big_Step_Motor(D, 1);
+	 Hand_Open();
+	 Mov_Medium_Step_Motor(B, 1.5);
+	 Mov_Forward_Till_White();
+}
+
+void B_Area_Catch(void)//B区域抓取函数 
+{
+     int result;
+
+     nowaposition = 1;
+	 flag = 0;
+	 while(! flag)
+	 {
+         Make_Next_Mov('B');
+		 if(nowaposition != 4)
+             Send_Check_Allowable_Message('B');
+	     result = Wait_For_Check_Result('B');
+         Catch_Or_Not(result);
+     }
+	 if(nowaposition == 2 || nowaposition == 3)
+	     Mov_Backward_Till_White();
+     else
+	     Mov_Forward_Till_White();
+}
+
+void B_Area_Send(void)//B区域送货函数 
+{
+     if(nowaposition > 2)
+	 {
+         Mov_Accurate_L_R(L, 8000);
+		 Mov_Big_Step_Motor(D, 22);
+	 }
+     Mov_Left_Till_White();
+	 Mov_Turn_Around();
+     Mov_Backward_Till_White();
+	 Mov_Right_Till_White();
+	 Mov_Accurate_F_B(F, 12500);
+	 Mov_Medium_Step_Motor(F, 1.5);
+     Mov_Big_Step_Motor(D, 1);
+	 Hand_Open();
+	 Mov_Medium_Step_Motor(B, 1.5);
+	 Mov_Backward_Till_White();
+}
+
+void A_Area_Catch(void)//A区域抓取函数 
+{
+     int result;
+
+     nowaposition = 1;
+	 flag = 0;
+	 while(! flag)
+	 {
+         Make_Next_Mov('A');
+         if(nowaposition != 4)
+		     Send_Check_Allowable_Message('A');
+	     result = Wait_For_Check_Result('A');
+         Catch_Or_Not(result);
+     }
+	 if(nowaposition == 2 || nowaposition == 3)
+	     Mov_Backward_Till_White();
+     else
+	     Mov_Forward_Till_White();
+}
+
+void A_Area_Send(void)//A区域送货函数 
+{
+     if(nowaposition > 2)
+	 {
+         Mov_Accurate_L_R(L, 8000);
+		 Mov_Big_Step_Motor(D, 22);
+	 }
+     Mov_Left_Till_White();
+	 Mov_Turn_Around();
+     Mov_Right_Till_White();
+	 Mov_Accurate_F_B(B, 12469);
+	 Mov_Medium_Step_Motor(F, 1.5);
+     Mov_Big_Step_Motor(D, 1);
+	 Hand_Open();
+	 Mov_Medium_Step_Motor(B, 1.5);
+     Mov_Forward_Till_White();
+}
+
+void Get_Hand_Position(void)//获取手臂传感器信息函数 
+{
+     if(PINF & (1 << PF1))  rightsensor = BLACK;//
+ 	 else  rightsensor = WHITE;
+}
+
+void Find_Back_Path(void)//寻找返回补货起始位置函数 
+{    
+     int i;
+
+     Mov_Left_Till_White();  
+	 Mov_Turn_Around();
+	 if(position[nowasuparea - 'A'] > 2)
+	     Mov_Big_Step_Motor(D, 19.25);
+     else
+	     Mov_Big_Step_Motor(U, 2.75);
+     for(i = 0; i < (3 - (nowasuparea - 'A')); i ++)
+	     Mov_Forward_Till_White();
+     Mov_Right_Till_White();
+	 Mov_Backward_Till_White();
+	 Mov_Accurate_F_B(F, 22000);
+	 Mov_Big_Step_Motor(D, 3.75);
+}
+
+void Get_GPS_Position(void)//获取定位传感器信息函数 
+{
+    if(PINF & (1 << PF2))  
+	    Line_GPS = BLACK;
+    else
+	    Line_GPS = WHITE;
+}
+
+void Hand_Open_Supply(void)//爪子张开至捕获宽度 
+{
+    PWM_Init();
+	Servo_Control(OPEN_FOR_SUPPLY, 0);
+	_delay_ms(1000);
+}
+
+void Find_Supply_Path(void)//寻找补货货柜位置 
+{
+     int i, littleflag;
+
+	 count = 0;
+	 temp_time = 6000;
+     EIMSK |= (1 << INT0);
+	 Get_GPS_Position();
+	 
+	 while(Line_GPS IS BLACK)
+	 {
+	     Motor3(ANTICLOCKWISE);
+		 Motor4(ANTICLOCKWISE);
+		 Get_GPS_Position();
+	 }
+	 Motor3(STOP);
+	 Motor4(STOP);
+	 Mov_Big_Step_Motor(D, 20);
+	 _delay_ms(500);
+	 EIMSK &= ~(1 << INT1);
+     Mov_Forward_Till_White();
+	 Mov_Left_Till_White();
+	 Mov_Turn_Around();
+	 for(i = 0; i < (nowasuparea - 'A'); i ++)
+	     Mov_Backward_Till_White();
+     if(position[nowasuparea - 'A'] > 2)
+	     Mov_Big_Step_Motor(U, 22);
+     Mov_Big_Step_Motor(U, 1);
+     Mov_Right_Till_White();
+	 if(nowasuparea > 'B')
+	 {
+	     if(position[nowasuparea - 'A'] == 2 || position[nowasuparea - 'A'] == 3)
+		 {
+		     littleflag = 0;
+		     if(nowasuparea == 'D')
+			     Mov_Accurate_F_B(B, 12469);
+			 else
+		         Mov_Accurate_F_B(B, 13000);
+		 }
+         else
+		 {
+		     littleflag = 1;
+		     Mov_Accurate_F_B(F, 13000);
+		 }
+	 }    
+	 else
+	 {
+	     if(position[nowasuparea - 'A'] == 2 || position[nowasuparea - 'A'] == 3)
+		 {
+		     littleflag = 1;
+			 if(nowasuparea == 'A')
+			     Mov_Accurate_F_B(F, 12469);
+			 else
+		         Mov_Accurate_F_B(F, 13000);
+		 }
+		 else
+		 {
+		     littleflag = 0;
+			 Mov_Accurate_F_B(B, 13000);
+		 }
+	 }
+	 Mov_Medium_Step_Motor(F, 1.5);
+	 Mov_Big_Step_Motor(D, 1);  
+	 Hand_Open_Supply();
+	 Mov_Medium_Step_Motor(B, 1.5);
+     if(littleflag)
+	     Mov_Backward_Till_White();
+     else
+	     Mov_Forward_Till_White();
+}
+
+void Find_Start_Position(void)//送货结束位置至寻找补货开始位置函数 
+{
+    Hand_Open_Supply();
+    Mov_Big_Step_Motor(U, 3.75);
+    Mov_Forward_Till_White();
+	Mov_Forward_Till_White();
+	Mov_Accurate_F_B(F, 22000);
+	Mov_Big_Step_Motor(D, 3.75);
+}
+
+void Supply_Catch_Or_Not(int result)//补货识别结果抓取或继续识别函数 
+{
+     if(result == CONTINUE)
+	     return ;
+	 supplynum ++;
+	 
+	 //Mov_Big_Step_Motor(D, 3.75);
+     Mov_Medium_Step_Motor(F, 1.5);
+	 if(result == DONE_CAN)
+	     Catch_Pop_Can();
+     else
+	 {
+	     Catch_Block();
+         Hand_Open_Supply();
+		 Catch_Block();
+	 }
+	 Mov_Big_Step_Motor(U, 1);
+	 Mov_Medium_Step_Motor(B, 1.5);
+	 Mov_Big_Step_Motor(U, 20);
+	 Find_Supply_Path();
+	 Find_Back_Path();
+}
+
+void Try_Supply(void)//补货主函数 
+{
+    int result;
+	Hand_Open_Supply();
+	DDRF &= 0XFD;
+
+    while(supplynum < 4)
+	{
+	 	nowaposition = 3;
+	 	Motor3(ANTICLOCKWISE);
+	 	Motor4(ANTICLOCKWISE);
+	    while(1)
+		{
+		    Get_Position();
+		    Get_Hand_Position();
+			while(rightsensor IS BLACK)
+			{
+			    Motor3(ANTICLOCKWISE);
+				Motor4(ANTICLOCKWISE);
+				Get_Hand_Position();
+			}
+			Motor3(STOP);
+			Motor4(STOP);
+            _delay_ms(300);
+            Get_Hand_Position();
+			if(rightsensor IS WHITE)
+			    break;
+		}
+        while(1)
+		{
+		    Get_Position();
+Get_Hand_Position();
+			while(rightsensor IS WHITE)
+			{
+			    Motor3(ANTICLOCKWISE);
+				Motor4(ANTICLOCKWISE);
+				Get_Hand_Position();
+			}
+			Motor3(STOP);
+			Motor4(STOP);
+			_delay_ms(300);
+			Get_Hand_Position();
+			if(rightsensor IS BLACK)
+                break;
+		}
+        Send_Check_Allowable_Message('E');
+     	result = Wait_For_Check_Result('E');
+	 	Supply_Catch_Or_Not(result);
+	}
+}
+
+int main(void)//主函数 
+{	 
+     DDRA = 0XFF;             //LED IO口设为输出
+	 DDRC = 0XFF;             //数码管段选设为输出
+	 DDRF |= 0X03;            //LED及数码管锁存IO口设为输出
+	 
+	 PORTF |= 0X0E;           
+	 PORTA = 0XFF;
+	 PORTC = 0XFF;            
+	 PORTF &= 0xF9;           //锁存数据关闭数码管 
+	 
+	 DDRB |= 0X30;            //PB4设为输出
+	 PORTB |= 0X30;           //关闭PB4外接的LED
+	 
+	 DDRA = 0xFF;
+     DDRC = 0x00;             //PC0~PC2:Motor1_Sensor  PC3~PC5:Motor2_Sensor  PC6、PC7:Motor3_Sensor
+	 DDRF = 0x00;             //PF0:Motor3_Sensor  PF1~PF3:Motor4_Sensor
+	 
+	 DDRD = 0X0C;
+     PORTD = 0XFF;            //INT0 INT1口设为输入(打开上拉电阻)
+	 
+	 PORTC = 0XFF;
+	
+     EICRA = 0X0F;
+
+     EIMSK |= (1 << INT0) | (1 << INT1);   //打开INT0 INT1中断   
+	 
+	 PORTA = 0X00;
+     DDRF &= 0XF9;
+	 sei();
+     
+	 Get_List_And_Wait_For_Start();
+	 Hand_Open();
+	 D_Area_Catch();
+	 D_Area_Send();
+	 C_Area_Catch();
+	 C_Area_Send();
+	 B_Area_Catch();
+	 B_Area_Send();
+	 A_Area_Catch();
+	 A_Area_Send();
+     Find_Start_Position();
+     Try_Supply();
+	 
+	 return 0;	
+}
